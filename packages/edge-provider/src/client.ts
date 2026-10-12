@@ -119,7 +119,7 @@ class BridgeProcess {
 
   private readonly pending = new Map<number, (reply: BridgeReply) => void>();
   private buffer = "";
-  private disposed = false;
+  disposed = false;
 
   constructor() {
     this.child.stdout.setEncoding("utf8");
@@ -179,10 +179,14 @@ class BridgeProcess {
   }
 }
 
+// One bridge process serves every client; a disposed process is replaced on
+// the next request instead of failing with "bridge process not running".
 let bridgeSingleton: BridgeProcess | undefined;
 
 function spawnBridge(): BridgeProcess {
-  bridgeSingleton ??= new BridgeProcess();
+  if (bridgeSingleton === undefined || bridgeSingleton.disposed) {
+    bridgeSingleton = new BridgeProcess();
+  }
   return bridgeSingleton;
 }
 
