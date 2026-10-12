@@ -76,7 +76,10 @@ try {
 } finally {
   controller.abort();
 }
+// The shared bridge child outlives client.close(); exit explicitly so the
+// spawnSync driver does not hang until the outer timeout.
 console.log("PASS");
+process.exit(0);
 `,
         ],
       {
