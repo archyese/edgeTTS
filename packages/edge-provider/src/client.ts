@@ -92,7 +92,9 @@ class PythonBridgeClient implements EdgeClient {
   }
 
   close(): void {
-    this.proc?.dispose();
+    // The bridge process is shared across clients; closing one client must
+    // not kill the child under concurrent requests. Release the reference;
+    // the bridge exits with the server or when idle-reaped.
     this.proc = undefined;
   }
 }

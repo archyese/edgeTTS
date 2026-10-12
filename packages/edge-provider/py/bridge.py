@@ -138,6 +138,7 @@ async def handle(cmd: dict) -> dict:
 
 async def main() -> None:
     loop = asyncio.get_event_loop()
+    pending: set[asyncio.Task[None]] = set()
     while True:
         line = await loop.run_in_executor(None, sys.stdin.readline)
         if not line:
@@ -149,9 +150,17 @@ async def main() -> None:
             cmd = json.loads(line)
         except json.JSONDecodeError:
             continue
-        result = await handle(cmd)
-        sys.stdout.write(json.dumps(result) + "\n")
-        sys.stdout.flush()
+        # Concurrent synthesis requests must not queue behind each other:
+        # the role-cast adapter fires one request per text segment.
+        task = asyncio.create_task(respond(cmd))
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+
+async def respond(cmd: dict) -> None:
+    result = await handle(cmd)
+    sys.stdout.write(json.dumps(result) + "\n")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":
