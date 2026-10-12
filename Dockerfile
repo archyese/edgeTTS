@@ -63,7 +63,7 @@ RUN find /prod/server -type f \
 FROM ${ALPINE_IMAGE} AS runtime
 
 # Keep the existing UID/GID and account name for deployment compatibility.
-RUN apk add --no-cache libstdc++ \
+RUN apk add --no-cache libstdc++ python3 py3-aiohttp \
   && addgroup -g 1000 node \
   && adduser -u 1000 -G node -s /bin/sh -D node \
   && mkdir -p /usr/local/share/licenses/bun
@@ -80,12 +80,16 @@ WORKDIR /app
 # an operator omits --read-only. Writable temporary data belongs under /tmp.
 COPY --from=builder /prod/server /app
 COPY --from=builder /build/apps/web/dist /app/web-dist
+# Synthesis runs through the Python bridge (see packages/edge-provider/src/client.ts):
+# the replacement WSS host fingerprints TLS and rejects Bun/Node handshakes.
+COPY --from=builder /build/packages/edge-provider/py/bridge.py /app/bridge.py
 
 ENV NODE_ENV=production \
     BUN_RUNTIME_TRANSPILER_CACHE_PATH=0 \
     HOST=0.0.0.0 \
     PORT=8080 \
-    WEB_DIST_DIR=/app/web-dist
+    WEB_DIST_DIR=/app/web-dist \
+    EDGETTS_BRIDGE_PATH=/app/bridge.py
 
 EXPOSE 8080
 

@@ -12,7 +12,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "py"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",

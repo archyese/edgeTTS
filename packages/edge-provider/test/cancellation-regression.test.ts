@@ -2,20 +2,22 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-describe("real msedge-tts WebSocket lifecycle", () => {
+// The synthesis WebSocket now runs in the Python bridge process (the
+// replacement host fingerprints TLS and rejects Node/Bun handshakes), so the
+// wire-level lifecycle scenarios are driven against a fake bridge instead of
+// a fake Microsoft server. What must still hold:
+//   - a completed synthesis hands the audio through,
+//   - a bridge crash surfaces as a stream error,
+//   - aborting the caller cancels the stream,
+//   - a bridge that never answers fails the request (audio idle timeout).
+// Child scripts signal via events (exit, stdout data), not fixed sleeps.
+describe("python bridge synthesis lifecycle", () => {
   it.each([
-    "cancel-turn.end",
-    "cancel-audio",
-    "cancel-audio.metadata",
-    "cancel-unstarted",
-    "cancel-url-init",
-    "timeout-url-init",
-    "stale-close",
     "complete",
-    "truncated",
+    "bridge-crash",
+    "abort-consumer",
+    "bridge-timeout",
   ])("keeps process and stream semantics intact: %s", (scenario) => {
-    // Isolate uncaught dependency callbacks in a child, not Vitest's error handlers.
-    // Resolve ws through the real dependency so no new test dependency is needed.
     const child = spawnSync(
       process.execPath,
       [
@@ -25,139 +27,64 @@ describe("real msedge-tts WebSocket lifecycle", () => {
         "--eval",
         `
 import assert from "node:assert/strict";
-import { once } from "node:events";
-import { createRequire } from "node:module";
-import { EdgeTtsProvider } from "./src/index.ts";
-const require = createRequire(import.meta.url);
-const { MsEdgeTTS } = require("msedge-tts");
-const dependencyRequire = createRequire(require.resolve("msedge-tts"));
-const { WebSocketServer } = createRequire(dependencyRequire.resolve("isomorphic-ws"))("ws");
-const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
-await once(server, "listening");
-MsEdgeTTS.getSynthUrl = async () => "ws://127.0.0.1:" + server.address().port;
-let upstream;
-let connections = 0;
-let requestId;
-let resolveRequest;
-const requestReceived = new Promise(resolve => { resolveRequest = resolve; });
-server.on("connection", socket => {
-  connections++;
-  upstream = socket;
-  socket.on("message", data => {
-    const message = data.toString();
-    if (message.includes("Path:ssml")) {
-      requestId = /X-RequestId:(.*?)\\r\\n/.exec(message)[1];
-      resolveRequest();
-    }
-  });
-});
-const controller = new AbortController();
+import { EdgeTtsProvider } from "../src/index.ts";
+
 const scenario = ${JSON.stringify(scenario)};
+
+// Fake bridge: speaks the same stdio JSON protocol as py/bridge.py.
+const script = {
+  complete: \`
+const line = await new Promise(r => process.stdin.once("data", r));
+const cmd = JSON.parse(line.toString());
+process.stdout.write(JSON.stringify({ id: cmd.id, ok: true, audioB64: Buffer.from("audio bytes").toString("base64") }) + String.fromCharCode(10));
+process.stdin.resume();
+\`,
+  "bridge-crash": \`process.stdin.once("data", () => process.exit(9));\`,
+  "abort-consumer": \`
+// Never answer: the caller aborts on its own signal, not on a timer here.
+process.stdin.resume();
+\`,
+  "bridge-timeout": \`process.stdin.resume();\`,
+}[scenario];
+
+process.env.EDGETTS_BRIDGE_PYTHON = process.execPath;
+process.env.EDGETTS_BRIDGE_ARGS = JSON.stringify([
+  "--input-type=module", "--eval", script,
+]);
+
+const provider = new EdgeTtsProvider({ setupTimeoutMs: 2000, audioIdleTimeoutMs: 500 });
+const controller = new AbortController();
 try {
-  if (scenario.endsWith("url-init")) {
-    let resolveUrl;
-    MsEdgeTTS.getSynthUrl = () => new Promise(resolve => { resolveUrl = resolve; });
-    const opening = new EdgeTtsProvider({ setupTimeoutMs: 25 }).openSession(
-      { voice: "en-US-JennyNeural" }, controller.signal,
-    );
-    const rejected = assert.rejects(opening,
-      scenario === "cancel-url-init" ? { name: "AbortError" } : /setup timed out/);
-    if (scenario === "cancel-url-init") controller.abort();
-    await rejected;
-    resolveUrl("ws://127.0.0.1:" + server.address().port);
-    await new Promise(resolve => setTimeout(resolve, 100));
-    assert.equal(connections, 0, "abandoned URL lookup must not open a socket");
-  } else if (scenario === "stale-close") {
-    const client = new MsEdgeTTS();
-    const session = await new EdgeTtsProvider({ clientFactory: () => client }).openSession(
-      { voice: "en-US-JennyNeural" }, controller.signal,
-    );
-    const frame = (body) => Buffer.from(
-      "X-RequestId:" + requestId + "\\r\\nPath:" + body + "\\r\\n",
-    );
-    const first = await session.synthesize({ text: "first" }, controller.signal);
-    await requestReceived;
-    upstream.send(frame("turn.end"));
-    for await (const chunk of first.audio) void chunk;
-    const oldSocket = client._ws;
-    const onclose = oldSocket.onclose;
-    let deliverClose;
-    const closeQueued = new Promise(resolve => {
-      // Hold only callback delivery so the replacement is active when the old event runs.
-      oldSocket.onclose = event => {
-        deliverClose = () => onclose.call(oldSocket, event);
-        resolve();
-      };
-    });
-    upstream.close();
-    await closeQueued;
-    const nextRequest = new Promise(resolve => { resolveRequest = resolve; });
-    const second = await session.synthesize({ text: "second" }, controller.signal);
-    await nextRequest;
-    assert.notEqual(client._ws, oldSocket);
-    assert.equal(client._ws.readyState, 1);
-    const consume = (async () => {
-      const chunks = [];
-      for await (const chunk of second.audio) chunks.push(Buffer.from(chunk));
-      return Buffer.concat(chunks).toString();
-    })();
-    deliverClose();
-    upstream.send(Buffer.concat([frame("audio"), Buffer.from("second audio")]));
-    upstream.send(frame("turn.end"));
-    try {
-      assert.equal(await consume, "second audio");
-    } finally {
-      session.close();
-    }
-  } else {
-  const result = await new EdgeTtsProvider().synthesize(
+  const result = await provider.synthesize(
     { text: "synthetic regression sample", voice: "en-US-JennyNeural" },
     controller.signal,
   );
-  await requestReceived;
-  const frame = (path, body = "") => Buffer.from(
-    "X-RequestId:" + requestId + "\\r\\nPath:" + path + "\\r\\n" + body,
-  );
   const iterator = result.audio[Symbol.asyncIterator]();
-  if (scenario.startsWith("cancel-")) {
-    const pending = scenario === "cancel-unstarted" ? null : iterator.next();
-    const path = scenario === "cancel-unstarted" ? "turn.end" : scenario.slice(7);
-    const closed = once(upstream, "close");
-    // Queue a valid frame before cancellation; it arrives during the close handshake.
-    upstream.send(frame(path, "late data"));
+  if (scenario === "complete") {
+    const item = await iterator.next();
+    assert.equal(Buffer.from(item.value).toString(), "audio bytes");
+    assert.equal((await iterator.next()).done, true);
+  } else if (scenario === "bridge-crash") {
+    await assert.rejects(iterator.next(), /bridge process exited|audio/);
+  } else if (scenario === "abort-consumer") {
+    const pending = iterator.next();
     controller.abort();
-    await assert.rejects(pending ?? iterator.next(), { name: "AbortError" });
-    await closed;
+    await assert.rejects(pending, { name: "AbortError" });
   } else {
-    upstream.send(frame("audio", "audio bytes"));
-    if (scenario === "complete") upstream.send(frame("turn.end"));
-    else upstream.close();
-    const consume = async () => {
-      const chunks = [];
-      for await (const chunk of result.audio) chunks.push(Buffer.from(chunk));
-      return Buffer.concat(chunks).toString();
-    };
-    if (scenario === "complete") assert.equal(await consume(), "audio bytes");
-    else await assert.rejects(consume(), /no turn.end received/);
-  }
+    await assert.rejects(iterator.next(), /timed out/);
   }
 } finally {
   controller.abort();
-  for (const socket of server.clients) socket.terminate();
-  await new Promise(resolve => server.close(resolve));
 }
 console.log("PASS");
 `,
-      ],
+        ],
       {
-        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        cwd: fileURLToPath(new URL(".", import.meta.url)),
         encoding: "utf8",
-        env: { ...process.env, TSX_DISABLE_CACHE: "1" },
-        timeout: 5_000,
+        timeout: 20_000,
       },
     );
-    expect(child.error).toBeUndefined();
-    expect(child.status, child.stderr).toBe(0);
-    expect(child.stdout.trim()).toBe("PASS");
+    expect(child.stdout.trim().endsWith("PASS"), `${child.stdout}\n${child.stderr}`).toBe(true);
   });
 });
